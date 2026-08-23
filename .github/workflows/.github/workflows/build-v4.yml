@@ -1,0 +1,172 @@
+name: Build e-Courier Desktop-Login APK v4
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-v4.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-v4:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Recreate base Android project
+        shell: bash
+        run: |
+          set -e
+
+          awk '
+            /^      - name: Create Android project$/ { found=1; next }
+            found && /^        run: \|$/ { capture=1; next }
+            capture && /^      - name:/ { exit }
+            capture {
+              sub(/^          /, "")
+              print
+            }
+          ' .github/workflows/build.yml > /tmp/create-project.sh
+
+          bash /tmp/create-project.sh
+
+      - name: Patch desktop login mode
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path("app/src/main/java/com/mahex/ecouriermobile/MainActivity.java")
+          s = p.read_text(encoding="utf-8")
+
+          marker = '''                  settings.setMixedContentMode(
+                      WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+                  );
+          '''
+
+          replacement = '''                  settings.setMixedContentMode(
+                      WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+                  );
+
+                  // Desktop browser identity for the UAA authentication pages.
+                  settings.setUserAgentString(
+                      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      + "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      + "Chrome/140.0.0.0 Safari/537.36"
+                  );
+
+                  settings.setLoadWithOverviewMode(true);
+          '''
+
+          if marker not in s:
+              raise SystemExit("WebSettings marker not found")
+          s = s.replace(marker, replacement, 1)
+
+          old_finished = '''                      public void onPageFinished(WebView view, String url) {
+                          super.onPageFinished(view, url);
+                          injectMobileFix(url);
+                          CookieManager.getInstance().flush();
+                      }
+          '''
+
+          new_finished = '''                      public void onPageFinished(WebView view, String url) {
+                          super.onPageFinished(view, url);
+
+                          if (isAuthenticationPage(url)) {
+                              injectDesktopLoginMode();
+                          } else {
+                              injectMobileFix(url);
+                          }
+
+                          CookieManager.getInstance().flush();
+                      }
+          '''
+
+          if old_finished not in s:
+              raise SystemExit("onPageFinished marker not found")
+          s = s.replace(old_finished, new_finished, 1)
+
+          insert_at = '''              private void injectMobileFix(String url) {
+          '''
+
+          helpers = '''              private boolean isAuthenticationPage(String url) {
+                  if (url == null) {
+                      return false;
+                  }
+
+                  String lower = url.toLowerCase();
+
+                  return lower.contains("/uaa")
+                      || lower.contains("/oauth")
+                      || lower.contains("/login");
+              }
+
+              private void injectDesktopLoginMode() {
+                  String js =
+                      "(function(){"
+                      + "var v=document.querySelector('meta[name=viewport]');"
+                      + "if(!v){v=document.createElement('meta');"
+                      + "v.name='viewport';document.head.appendChild(v);}"
+                      + "v.content='width=1200,initial-scale=0.32,"
+                      + "minimum-scale=0.20,maximum-scale=5,user-scalable=yes';"
+                      + "var old=document.getElementById('ec-mobile-fix');"
+                      + "if(old){old.remove();}"
+                      + "document.documentElement.style.minWidth='1200px';"
+                      + "document.body.style.minWidth='1200px';"
+                      + "var candidates=document.querySelectorAll("
+                      + "'a.btn,button.btn,input[type=submit],input[type=button]');"
+                      + "for(var i=0;i<candidates.length;i++){"
+                      + "var e=candidates[i];"
+                      + "var t=(e.innerText||e.value||'').trim();"
+                      + "if(t){"
+                      + "e.style.visibility='visible';"
+                      + "e.style.opacity='1';"
+                      + "}"
+                      + "}"
+                      + "})();";
+
+                  webView.evaluateJavascript(js, null);
+              }
+
+'''
+
+          if insert_at not in s:
+              raise SystemExit("injectMobileFix marker not found")
+          s = s.replace(insert_at, helpers + insert_at, 1)
+
+          p.write_text(s, encoding="utf-8")
+          PY
+
+      - name: Build APK v4
+        run: gradle --no-daemon assembleDebug
+
+      - name: Upload APK v4
+        uses: actions/upload-artifact@v4
+        with:
+          name: ecourier-desktop-login-apk-v4
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
