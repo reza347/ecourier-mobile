@@ -1,0 +1,601 @@
+name: Build e-Courier Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Create Android project
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p app/src/main/java/com/mahex/ecouriermobile
+          mkdir -p app/src/main/res/xml
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "ECourierMobile"
+          include(":app")
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.mahex.ecouriermobile'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId "com.mahex.ecouriermobile"
+                  minSdk 26
+                  targetSdk 35
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF
+
+          cat > app/src/main/res/xml/network_security_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <network-security-config>
+              <base-config cleartextTrafficPermitted="false" />
+              <domain-config cleartextTrafficPermitted="true">
+                  <domain includeSubdomains="false">ecourier.mahex.com</domain>
+              </domain-config>
+          </network-security-config>
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="e-Courier"
+                  android:networkSecurityConfig="@xml/network_security_config"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="keyboard|keyboardHidden|orientation|screenSize"
+                      android:exported="true">
+
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/mahex/ecouriermobile/MainActivity.java <<'EOF'
+          package com.mahex.ecouriermobile;
+
+          import android.app.Activity;
+          import android.app.DownloadManager;
+          import android.content.ActivityNotFoundException;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.graphics.Color;
+          import android.net.Uri;
+          import android.net.http.SslError;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.webkit.CookieManager;
+          import android.webkit.DownloadListener;
+          import android.webkit.SslErrorHandler;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.webkit.URLUtil;
+          import android.widget.FrameLayout;
+          import android.widget.ProgressBar;
+          import android.widget.Toast;
+          import android.util.Base64;
+
+          import java.nio.charset.StandardCharsets;
+
+          public class MainActivity extends Activity {
+
+              private static final String HOME_URL = "https://ecourier.mahex.com/";
+              private static final String MAIN_HOST = "ecourier.mahex.com";
+              private static final int FILE_CHOOSER_REQUEST = 1001;
+
+              private WebView webView;
+              private ProgressBar progressBar;
+              private ValueCallback<Uri[]> fileChooserCallback;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  FrameLayout root = new FrameLayout(this);
+                  root.setBackgroundColor(Color.WHITE);
+
+                  webView = new WebView(this);
+                  root.addView(
+                      webView,
+                      new FrameLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT,
+                          ViewGroup.LayoutParams.MATCH_PARENT
+                      )
+                  );
+
+                  progressBar = new ProgressBar(
+                      this,
+                      null,
+                      android.R.attr.progressBarStyleHorizontal
+                  );
+                  progressBar.setMax(100);
+
+                  FrameLayout.LayoutParams progressParams =
+                      new FrameLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT,
+                          Math.max(4, (int)(3 * getResources().getDisplayMetrics().density))
+                      );
+
+                  root.addView(progressBar, progressParams);
+                  setContentView(root);
+
+                  configureWebView();
+
+                  if (savedInstanceState == null) {
+                      webView.loadUrl(HOME_URL);
+                  } else {
+                      webView.restoreState(savedInstanceState);
+                  }
+              }
+
+              private void configureWebView() {
+                  WebSettings settings = webView.getSettings();
+
+                  settings.setJavaScriptEnabled(true);
+                  settings.setDomStorageEnabled(true);
+                  settings.setDatabaseEnabled(true);
+                  settings.setUseWideViewPort(true);
+                  settings.setLoadWithOverviewMode(false);
+                  settings.setSupportZoom(true);
+                  settings.setBuiltInZoomControls(false);
+                  settings.setDisplayZoomControls(false);
+                  settings.setJavaScriptCanOpenWindowsAutomatically(true);
+                  settings.setSupportMultipleWindows(false);
+                  settings.setMixedContentMode(
+                      WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+                  );
+
+                  CookieManager cookieManager = CookieManager.getInstance();
+                  cookieManager.setAcceptCookie(true);
+                  cookieManager.setAcceptThirdPartyCookies(webView, true);
+
+                  webView.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public boolean shouldOverrideUrlLoading(
+                          WebView view,
+                          WebResourceRequest request
+                      ) {
+                          return handleUri(request.getUrl());
+                      }
+
+                      @Override
+                      public boolean shouldOverrideUrlLoading(
+                          WebView view,
+                          String url
+                      ) {
+                          return handleUri(Uri.parse(url));
+                      }
+
+                      @Override
+                      public void onPageFinished(WebView view, String url) {
+                          super.onPageFinished(view, url);
+                          injectMobileFix(url);
+                          CookieManager.getInstance().flush();
+                      }
+
+                      @Override
+                      public void onReceivedSslError(
+                          WebView view,
+                          SslErrorHandler handler,
+                          SslError error
+                      ) {
+                          handler.cancel();
+                          Toast.makeText(
+                              MainActivity.this,
+                              "خطای امنیتی SSL",
+                              Toast.LENGTH_LONG
+                          ).show();
+                      }
+                  });
+
+                  webView.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public void onProgressChanged(WebView view, int progress) {
+                          progressBar.setProgress(progress);
+                          progressBar.setVisibility(
+                              progress >= 100 ? View.GONE : View.VISIBLE
+                          );
+                      }
+
+                      @Override
+                      public boolean onShowFileChooser(
+                          WebView webView,
+                          ValueCallback<Uri[]> filePathCallback,
+                          FileChooserParams fileChooserParams
+                      ) {
+                          if (fileChooserCallback != null) {
+                              fileChooserCallback.onReceiveValue(null);
+                          }
+
+                          fileChooserCallback = filePathCallback;
+
+                          try {
+                              Intent intent = fileChooserParams.createIntent();
+                              startActivityForResult(
+                                  intent,
+                                  FILE_CHOOSER_REQUEST
+                              );
+                              return true;
+                          } catch (ActivityNotFoundException e) {
+                              fileChooserCallback = null;
+                              Toast.makeText(
+                                  MainActivity.this,
+                                  "انتخاب فایل در دسترس نیست",
+                                  Toast.LENGTH_LONG
+                              ).show();
+                              return false;
+                          }
+                      }
+                  });
+
+                  webView.setDownloadListener(new DownloadListener() {
+                      @Override
+                      public void onDownloadStart(
+                          String url,
+                          String userAgent,
+                          String contentDisposition,
+                          String mimeType,
+                          long contentLength
+                      ) {
+                          try {
+                              DownloadManager.Request request =
+                                  new DownloadManager.Request(Uri.parse(url));
+
+                              String cookies =
+                                  CookieManager.getInstance().getCookie(url);
+
+                              if (cookies != null) {
+                                  request.addRequestHeader(
+                                      "Cookie",
+                                      cookies
+                                  );
+                              }
+
+                              if (userAgent != null) {
+                                  request.addRequestHeader(
+                                      "User-Agent",
+                                      userAgent
+                                  );
+                              }
+
+                              String fileName = URLUtil.guessFileName(
+                                  url,
+                                  contentDisposition,
+                                  mimeType
+                              );
+
+                              request.setTitle(fileName);
+                              request.setNotificationVisibility(
+                                  DownloadManager.Request
+                                      .VISIBILITY_VISIBLE_NOTIFY_COMPLETED
+                              );
+
+                              request.setDestinationInExternalFilesDir(
+                                  MainActivity.this,
+                                  Environment.DIRECTORY_DOWNLOADS,
+                                  fileName
+                              );
+
+                              DownloadManager manager =
+                                  (DownloadManager) getSystemService(
+                                      Context.DOWNLOAD_SERVICE
+                                  );
+
+                              manager.enqueue(request);
+
+                              Toast.makeText(
+                                  MainActivity.this,
+                                  "دانلود شروع شد",
+                                  Toast.LENGTH_SHORT
+                              ).show();
+
+                          } catch (Exception e) {
+                              Toast.makeText(
+                                  MainActivity.this,
+                                  "خطا در دانلود",
+                                  Toast.LENGTH_LONG
+                              ).show();
+                          }
+                      }
+                  });
+              }
+
+              private boolean handleUri(Uri uri) {
+                  if (uri == null) {
+                      return false;
+                  }
+
+                  String scheme = uri.getScheme();
+
+                  if ("http".equalsIgnoreCase(scheme)
+                      || "https".equalsIgnoreCase(scheme)) {
+                      return false;
+                  }
+
+                  try {
+                      startActivity(
+                          new Intent(Intent.ACTION_VIEW, uri)
+                      );
+                  } catch (Exception ignored) {
+                  }
+
+                  return true;
+              }
+
+              private void injectMobileFix(String url) {
+                  try {
+                      Uri uri = Uri.parse(url);
+
+                      if (uri.getHost() == null
+                          || !MAIN_HOST.equalsIgnoreCase(uri.getHost())) {
+                          return;
+                      }
+
+                      String css =
+                          "html,body{max-width:100vw!important;}"
+                          + "html{-webkit-text-size-adjust:100%;}"
+                          + "body{overflow-x:hidden!important;}"
+                          + "*,*:before,*:after{box-sizing:border-box!important;}"
+                          + "img,video,canvas,svg,iframe{max-width:100%!important;}"
+                          + "@media(max-width:767px){"
+                          + "body{min-width:0!important;width:100%!important;}"
+                          + ".wrapper,.content-wrapper,.right-side,.main-footer,"
+                          + ".content,.page-container,#page-content-wrapper{"
+                          + "min-width:0!important;max-width:100%!important;}"
+                          + ".content-wrapper,.right-side,.main-footer{"
+                          + "margin-left:0!important;margin-right:0!important;}"
+                          + ".content{padding:7px!important;}"
+                          + ".fixed-header{position:static!important;"
+                          + "width:100%!important;height:auto!important;}"
+                          + ".ui-header-title{display:flex!important;"
+                          + "flex-wrap:wrap!important;width:100%!important;"
+                          + "gap:6px!important;}"
+                          + ".split-left,.split-right,"
+                          + ".ui-header-title .split-left,"
+                          + ".ui-header-title .split-right{"
+                          + "float:none!important;width:100%!important;"
+                          + "max-width:100%!important;margin:0!important;}"
+                          + ".ui-header-image{display:none!important;}"
+                          + "#wrapper,#wrapper.toggled{"
+                          + "padding-left:0!important;padding-right:0!important;"
+                          + "width:100%!important;}"
+                          + "#wrapper.toggled #page-content-wrapper{"
+                          + "position:relative!important;margin:0!important;}"
+                          + "#sidebar-wrapper{position:fixed!important;"
+                          + "top:0!important;right:0!important;left:auto!important;"
+                          + "width:0!important;height:100vh!important;"
+                          + "margin:0!important;overflow-y:auto!important;"
+                          + "overflow-x:hidden!important;z-index:10000!important;"
+                          + "background:#fff!important;}"
+                          + "#wrapper.toggled #sidebar-wrapper{"
+                          + "width:94vw!important;max-width:350px!important;}"
+                          + "#sidebar-wrapper .sidebar-nav{"
+                          + "position:relative!important;width:100%!important;}"
+                          + "#search-box-body{max-height:calc(100vh - 120px)!important;"
+                          + "overflow-y:auto!important;overflow-x:hidden!important;}"
+                          + "form,fieldset,.form-group,.input-group,"
+                          + ".searchFormSection,.box,.box-body,.box-header{"
+                          + "max-width:100%!important;}"
+                          + ".input-group{width:100%!important;}"
+                          + "input.form-control,select.form-control,"
+                          + "textarea.form-control{width:100%!important;"
+                          + "max-width:100%!important;font-size:16px!important;}"
+                          + ".select2-container,.select2-container.form-control,"
+                          + "[id^='s2id_'],.select2-choice,.select2-choices{"
+                          + "width:100%!important;min-width:0!important;"
+                          + "max-width:100%!important;}"
+                          + ".table-responsive,.dataTables_wrapper{"
+                          + "width:100%!important;max-width:100%!important;"
+                          + "overflow-x:auto!important;}"
+                          + "table.dataTable,.dataTables_wrapper table{"
+                          + "min-width:900px!important;width:max-content!important;"
+                          + "max-width:none!important;white-space:nowrap!important;}"
+                          + ".table-header-links,.table-header-select{"
+                          + "float:none!important;width:100%!important;}"
+                          + ".table-header-links{display:flex!important;"
+                          + "flex-wrap:wrap!important;gap:5px!important;}"
+                          + ".pagination{display:flex!important;"
+                          + "flex-wrap:wrap!important;}"
+                          + ".modal-dialog,.modal-dialog.modal-xl,.modal-lg,.modal-sm{"
+                          + "width:auto!important;max-width:calc(100vw - 14px)!important;"
+                          + "margin:7px auto!important;}"
+                          + ".modal-body{overflow-x:auto!important;}"
+                          + ".btn:not(.btn-xs){min-height:42px!important;"
+                          + "white-space:normal!important;}"
+                          + ".main-sidebar .slimScrollDiv,"
+                          + ".main-sidebar .sidebar{height:auto!important;"
+                          + "max-height:none!important;}"
+                          + "}";
+
+                      String encoded = Base64.encodeToString(
+                          css.getBytes(StandardCharsets.UTF_8),
+                          Base64.NO_WRAP
+                      );
+
+                      String js =
+                          "(function(){"
+                          + "var v=document.querySelector('meta[name=viewport]');"
+                          + "if(!v){v=document.createElement('meta');"
+                          + "v.name='viewport';document.head.appendChild(v);}"
+                          + "v.content='width=device-width,initial-scale=1,viewport-fit=cover';"
+                          + "var old=document.getElementById('ec-mobile-fix');"
+                          + "if(old)old.remove();"
+                          + "var s=document.createElement('style');"
+                          + "s.id='ec-mobile-fix';"
+                          + "s.textContent=atob('" + encoded + "');"
+                          + "document.head.appendChild(s);"
+                          + "})();";
+
+                      webView.evaluateJavascript(js, null);
+
+                  } catch (Exception ignored) {
+                  }
+              }
+
+              @Override
+              protected void onActivityResult(
+                  int requestCode,
+                  int resultCode,
+                  Intent data
+              ) {
+                  if (requestCode == FILE_CHOOSER_REQUEST) {
+                      Uri[] result = null;
+
+                      if (resultCode == RESULT_OK && data != null) {
+                          if (data.getClipData() != null) {
+                              int count =
+                                  data.getClipData().getItemCount();
+
+                              result = new Uri[count];
+
+                              for (int i = 0; i < count; i++) {
+                                  result[i] =
+                                      data.getClipData()
+                                          .getItemAt(i)
+                                          .getUri();
+                              }
+
+                          } else if (data.getData() != null) {
+                              result = new Uri[]{data.getData()};
+                          }
+                      }
+
+                      if (fileChooserCallback != null) {
+                          fileChooserCallback.onReceiveValue(result);
+                          fileChooserCallback = null;
+                      }
+
+                      return;
+                  }
+
+                  super.onActivityResult(
+                      requestCode,
+                      resultCode,
+                      data
+                  );
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (webView != null && webView.canGoBack()) {
+                      webView.goBack();
+                  } else {
+                      super.onBackPressed();
+                  }
+              }
+
+              @Override
+              protected void onSaveInstanceState(Bundle outState) {
+                  webView.saveState(outState);
+                  super.onSaveInstanceState(outState);
+              }
+          }
+          EOF
+
+      - name: Build APK
+        run: gradle --no-daemon assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ecourier-mobile-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
