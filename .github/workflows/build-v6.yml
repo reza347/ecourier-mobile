@@ -1,0 +1,146 @@
+name: Build e-Courier Fresh-Session APK v6
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-v6.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-v6:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Recreate proven base project
+        shell: bash
+        run: |
+          set -e
+
+          awk '
+            /^      - name: Create Android project$/ { found=1; next }
+            found && /^        run: \|$/ { capture=1; next }
+            capture && /^      - name:/ { exit }
+            capture {
+              sub(/^          /, "")
+              print
+            }
+          ' .github/workflows/build.yml > /tmp/create-project.sh
+
+          bash /tmp/create-project.sh
+
+      - name: Patch clean OAuth flow
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          g = Path("app/build.gradle")
+          s = g.read_text(encoding="utf-8")
+          s = s.replace(
+              'applicationId "com.mahex.ecouriermobile"',
+              'applicationId "com.mahex.ecouriermobile.v6"'
+          )
+          s = s.replace("versionCode 1", "versionCode 6")
+          s = s.replace('versionName "1.0"', 'versionName "6.0"')
+          g.write_text(s, encoding="utf-8")
+
+          m = Path("app/src/main/AndroidManifest.xml")
+          s = m.read_text(encoding="utf-8")
+          s = s.replace('android:label="e-Courier"', 'android:label="e-Courier v6"')
+          m.write_text(s, encoding="utf-8")
+
+          p = Path("app/src/main/java/com/mahex/ecouriermobile/MainActivity.java")
+          s = p.read_text(encoding="utf-8")
+
+          s = s.replace(
+              'private static final String HOME_URL = "https://ecourier.mahex.com/";',
+              'private static final String HOME_URL = "http://ecourier.mahex.com/ecourier-web/agent/shipment";'
+          )
+
+          old = '''                      public void onPageFinished(WebView view, String url) {
+                          super.onPageFinished(view, url);
+                          injectMobileFix(url);
+                          CookieManager.getInstance().flush();
+                      }
+          '''
+
+          new = '''                      public void onPageFinished(WebView view, String url) {
+                          super.onPageFinished(view, url);
+
+                          if (url != null && url.contains("/ecourier-web/")) {
+                              injectMobileFix(url);
+                          }
+
+                          if (url != null && url.contains("/uaa")) {
+                              String uaaHelper =
+                                  "(function(){"
+                                  + "var old=document.getElementById('ec-v6-debug');"
+                                  + "if(old){old.remove();}"
+                                  + "var b=document.createElement('div');"
+                                  + "b.id='ec-v6-debug';"
+                                  + "b.textContent='v6: '+location.protocol+'//'+location.host+location.pathname;"
+                                  + "b.style.cssText='position:fixed;left:6px;bottom:6px;"
+                                  + "z-index:2147483647;background:#111;color:#fff;"
+                                  + "padding:5px 8px;border-radius:5px;font:12px sans-serif;"
+                                  + "opacity:.80;max-width:94vw;word-break:break-all';"
+                                  + "document.body.appendChild(b);"
+                                  + "var links=document.querySelectorAll('a[href]');"
+                                  + "for(var i=0;i<links.length;i++){"
+                                  + "var h=links[i].getAttribute('href')||'';"
+                                  + "var t=(links[i].textContent||'').trim().toLowerCase();"
+                                  + "if(h.indexOf('/ecourier-web/')>=0 && t.indexOf('ecourier')>=0){"
+                                  + "setTimeout(function(x){return function(){window.location.href=x.href;};}(links[i]),500);"
+                                  + "break;"
+                                  + "}"
+                                  + "}"
+                                  + "})();";
+
+                              view.evaluateJavascript(uaaHelper, null);
+                          }
+
+                          CookieManager.getInstance().flush();
+                      }
+          '''
+
+          if old not in s:
+              raise SystemExit("Could not locate onPageFinished in base project")
+
+          s = s.replace(old, new, 1)
+          p.write_text(s, encoding="utf-8")
+          PY
+
+      - name: Build APK v6
+        run: gradle --no-daemon assembleDebug
+
+      - name: Upload APK v6
+        uses: actions/upload-artifact@v4
+        with:
+          name: ecourier-fresh-session-apk-v6
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
